@@ -20,7 +20,7 @@ const config = {
 const SENTINEL_SDK_KEY = process.env.CROO_SDK_KEY || 'croo_sk_65d4e23e8574ed7dd7a94f8ff2911c33';
 const AGENT_ID         = process.env.SENTINEL_AGENT_ID  || '6c4b9903-0dad-4515-8d08-77cab19f5967';
 const SERVICE_ID       = process.env.SENTINEL_SERVICE_ID || '52ef257f-6efb-46cd-b0db-50638f2fbcf7';
-const RENDER_URL       = process.env.RENDER_EXTERNAL_URL || 'https://sentinel-agent.onrender.com';
+const RENDER_URL       = process.env.RENDER_EXTERNAL_URL || 'https://sentinel-agent-e787.onrender.com';
 
 // ════════════════════════════════════════════════════════════════════
 // DECISION ENGINE — deterministic, no LLM on the verdict
