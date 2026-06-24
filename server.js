@@ -25,26 +25,69 @@ const RENDER_URL       = process.env.RENDER_EXTERNAL_URL || 'https://sentinel-ag
 // DECISION ENGINE
 // ════════════════════════════════════════════════════════════════════
 
+// Weighted risk factor penalties — different risks carry different compliance weight
+const RISK_WEIGHTS = {
+  // Critical — automatic red flags
+  'fraud':            -15, 'scam':            -15, 'criminal':      -15,
+  'conviction':       -15, 'sec enforcement': -15, 'sanctions':     -15,
+  'rug pull':         -15, 'ponzi':           -15,
+  // High
+  'regulatory':        -5, 'enforcement':      -5, 'lawsuit':        -5,
+  'hack':              -5, 'exploit':          -5, 'vulnerability':  -5,
+  'insolvency':        -5, 'bankruptcy':       -5,
+  // Medium
+  'smart contract':    -3, 'liquidity':        -2, 'concentration':  -2,
+  'governance':        -2, 'centrali':         -2, 'custody':        -2,
+  // Low
+  'market':            -1, 'volatility':       -1, 'competition':    -1,
+  'regulatory exposure': -2,
+};
+
+function weightRiskFactor(factor) {
+  const lower = factor.toLowerCase();
+  for (const [keyword, weight] of Object.entries(RISK_WEIGHTS)) {
+    if (lower.includes(keyword)) return { weight, matched: keyword };
+  }
+  return { weight: -2, matched: 'general' }; // default penalty
+}
+
 function computeComplianceScore(trustScore, confidence, sentiment, incidents, riskFactors) {
-  if (incidents?.length > 0) return 0;
-  if (trustScore === null || trustScore === undefined) return null;
+  if (incidents?.length > 0) return { score: 0, breakdown: null };
+  if (trustScore === null || trustScore === undefined) return { score: null, breakdown: null };
 
-  let score = trustScore;
-
-  // Sentiment adjustment (±8 points)
-  if (sentiment === 'positive') score = Math.min(100, score + 8);
-  if (sentiment === 'negative') score = Math.max(0,   score - 8);
-
-  // Confidence adjustment (low confidence reduces score by up to 10)
+  const base = Number(trustScore);
   const conf = Number(confidence) || 50;
-  if (conf < 45) score = Math.max(0, score - 10);
-  else if (conf < 60) score = Math.max(0, score - 5);
+  let score = base;
 
-  // Risk factor penalty (−2 per confirmed risk, max −12)
-  const penalty = Math.min(12, (riskFactors?.length || 0) * 2);
-  score = Math.max(0, score - penalty);
+  // Sentiment adjustment
+  const sentimentAdj = sentiment === 'positive' ? +5
+                      : sentiment === 'negative' ? -8
+                      : 0;
+  score = Math.min(100, Math.max(0, score + sentimentAdj));
 
-  return Math.round(score);
+  // Confidence adjustment
+  const confAdj = conf < 45 ? -10 : conf < 60 ? -5 : 0;
+  score = Math.max(0, score + confAdj);
+
+  // Weighted risk factor penalties
+  const riskBreakdown = (riskFactors || []).map(f => {
+    const { weight, matched } = weightRiskFactor(f);
+    return { factor: f, penalty: weight, matched };
+  });
+  const totalRiskPenalty = Math.max(-20, riskBreakdown.reduce((sum, r) => sum + r.penalty, 0));
+  score = Math.max(0, score + totalRiskPenalty);
+
+  return {
+    score: Math.round(score),
+    breakdown: {
+      baseTrustScore:   base,
+      sentimentAdj:     sentimentAdj === 0 ? '+0 (neutral)' : `${sentimentAdj > 0 ? '+' : ''}${sentimentAdj} (${sentiment})`,
+      confidenceAdj:    confAdj === 0 ? '+0 (adequate)' : `${confAdj} (confidence ${conf}%)`,
+      riskPenalty:      `${totalRiskPenalty} (${riskBreakdown.length} risk factor${riskBreakdown.length !== 1 ? 's' : ''})`,
+      riskBreakdown,
+      finalScore:       Math.round(score),
+    },
+  };
 }
 
 function runSentinel(input) {
@@ -63,7 +106,9 @@ function runSentinel(input) {
   const highConf   = conf >= 65;
   const lowConf    = conf < 45;
 
-  const complianceScore = computeComplianceScore(score, conf, sentiment, incidents, riskFactors);
+  const complianceResult = computeComplianceScore(score, conf, sentiment, incidents, riskFactors);
+  const complianceScore    = complianceResult?.score ?? null;
+  const complianceBreakdown = complianceResult?.breakdown ?? null;
 
   // ── Hard override ────────────────────────────────────────────────
   if (incidents?.length > 0) {
@@ -80,6 +125,7 @@ function runSentinel(input) {
         'Do not integrate',
         'Re-evaluate only if criminal/regulatory status materially changes',
       ],
+      complianceBreakdown: null,
       override: {
         triggered: true,
         type:      'HARD_TRUST_EVENT',
@@ -104,6 +150,7 @@ function runSentinel(input) {
       reason:           'Trust score unavailable. Cannot produce a compliance decision without verified VERIS data.',
       reviewPeriod:     'Re-audit required before engagement',
       recommendedActions: ['Do not engage until trust data is available', 'Request re-audit from VERIS'],
+      complianceBreakdown: null,
       override:         { triggered: false },
       inputSources: {
         veris: { trustScore: null, incidents: [] },
@@ -175,6 +222,7 @@ function runSentinel(input) {
     verdict,
     riskClass,
     complianceScore,
+    complianceBreakdown,
     confidence:  highConf ? 'HIGH' : lowConf ? 'LOW' : 'MEDIUM',
     reason,
     reviewPeriod,
@@ -250,6 +298,18 @@ Confidence:        ${decision.confidence}
 Review Period:     ${decision.reviewPeriod}
   Review Reason:     ${reviewReason}
 ═══════════════════════════════════════════════
+COMPLIANCE SCORE BREAKDOWN
+${decision.complianceBreakdown ? `
+  Base Trust Score:   ${decision.complianceBreakdown.baseTrustScore}/100
+  Sentiment:          ${decision.complianceBreakdown.sentimentAdj}
+  Confidence:         ${decision.complianceBreakdown.confidenceAdj}
+  Risk Penalties:     ${decision.complianceBreakdown.riskPenalty}
+  ─────────────────────────────────
+  Final Compliance:   ${decision.complianceBreakdown.finalScore}/100
+${decision.complianceBreakdown.riskBreakdown?.length > 0 ?
+  decision.complianceBreakdown.riskBreakdown.map(r => `  Risk: "${r.factor}" → ${r.penalty} pts (${r.matched})`).join('\n') : ''}` :
+  '  Score override applied (hard trust event or insufficient data)'}
+══════════════════════════════════════════════
 REASONING
 ${decision.reason}
 ${overrideBlock}
