@@ -201,8 +201,17 @@ function formatSentinelReport(decision, input) {
     'INSUFFICIENT DATA':    '❓',
   }[decision.verdict] || '—';
 
+  // Review period reasoning
+  const reviewReason = {
+    'PROCEED':              'Strong trust and compliance signals. Standard monitoring cadence.',
+    'PROCEED WITH CAUTION': 'Adequate signals but evidence gaps present. Closer monitoring required.',
+    'HIGH RISK':            'Below acceptable threshold. Re-audit required before re-engagement.',
+    'AVOID':                'Critical risk detected. No review scheduled until circumstances materially change.',
+    'INSUFFICIENT DATA':    'Cannot assess without complete trust data.',
+  }[decision.verdict] || '';
+
   const actions = (decision.recommendedActions || [])
-    .map(a => `  • ${a}`).join('\n');
+    .map(a => `  ✓ ${a}`).join('\n');
 
   const flags = decision.flags?.length
     ? decision.flags.map(f => `  ⚑ ${f}`).join('\n')
@@ -239,6 +248,7 @@ Compliance Score:  ${decision.complianceScore ?? 'N/A'}/100
 Risk Class:        ${decision.riskClass}
 Confidence:        ${decision.confidence}
 Review Period:     ${decision.reviewPeriod}
+  Review Reason:     ${reviewReason}
 ═══════════════════════════════════════════════
 REASONING
 ${decision.reason}
