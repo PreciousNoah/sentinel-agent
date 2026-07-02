@@ -90,6 +90,49 @@ function computeComplianceScore(trustScore, confidence, sentiment, incidents, ri
   };
 }
 
+// Normalize CROO schema objects to plain strings
+// CROO sends {type, severity, description} — extract the description or build a string
+function normalizeItem(item) {
+  if (!item) return null;
+  if (typeof item === 'string') return item.trim();
+  if (typeof item === 'object') {
+    // Use description if available
+    if (item.description) return String(item.description).trim();
+    if (item.name)        return String(item.name).trim();
+    if (item.label)       return String(item.label).trim();
+    if (item.value)       return String(item.value).trim();
+    // Fallback: join all string values
+    const vals = Object.values(item).filter(v => typeof v === 'string' && v.length > 2);
+    return vals.join(' — ') || JSON.stringify(item);
+  }
+  return String(item).trim();
+}
+
+// Check if an incident represents a genuinely confirmed hard trust event
+// "No confirmed fraud" should NEVER trigger a hard override
+const HARD_EVENT_KEYWORDS = [
+  'confirmed fraud', 'fraud confirmed', 'criminal conviction', 'convicted',
+  'sec enforcement', 'sanctions', 'ofac', 'rug pull', 'confirmed rug',
+  'confirmed scam', 'scam confirmed', 'bankrupt', 'criminal charges',
+  'guilty', 'indicted', 'confirmed exploit', 'confirmed hack',
+];
+const NON_EVENTS = [
+  'no confirmed', 'not confirmed', 'no fraud', 'no scam', 'no hack',
+  'none confirmed', 'no history', 'no evidence', 'not applicable',
+];
+
+function isHardEvent(item) {
+  const text = normalizeItem(item)?.toLowerCase() || '';
+  // Explicitly exclude "no confirmed X" phrases
+  if (NON_EVENTS.some(n => text.includes(n))) return false;
+  // Check severity field if object
+  if (typeof item === 'object' && item.severity) {
+    const sev = String(item.severity).toLowerCase();
+    if (sev === 'none' || sev === 'low' || sev === 'minimal') return false;
+  }
+  return HARD_EVENT_KEYWORDS.some(k => text.includes(k));
+}
+
 function runSentinel(input) {
   const {
     trustScore,
@@ -99,6 +142,12 @@ function runSentinel(input) {
     incidents    = [],
   } = input;
 
+  // Normalize all items — CROO may send objects or strings
+  const normalizedIncidents   = (incidents   || []).map(normalizeItem).filter(Boolean);
+  const normalizedRiskFactors = (riskFactors || []).map(normalizeItem).filter(Boolean);
+  // Only genuine hard events trigger the override
+  const confirmedHardEvents   = normalizedIncidents.filter(isHardEvent);
+
   const score      = trustScore !== null && trustScore !== undefined ? Number(trustScore) : null;
   const conf       = Number(confidence) || 50;
   const isNegative = sentiment === 'negative';
@@ -106,18 +155,18 @@ function runSentinel(input) {
   const highConf   = conf >= 65;
   const lowConf    = conf < 45;
 
-  const complianceResult = computeComplianceScore(score, conf, sentiment, incidents, riskFactors);
+  const complianceResult = computeComplianceScore(score, conf, sentiment, confirmedHardEvents, normalizedRiskFactors);
   const complianceScore    = complianceResult?.score ?? null;
   const complianceBreakdown = complianceResult?.breakdown ?? null;
 
   // ── Hard override ────────────────────────────────────────────────
-  if (incidents?.length > 0) {
+  if (confirmedHardEvents.length > 0) {
     return {
       verdict:          'AVOID',
       riskClass:        'CRITICAL',
       complianceScore:  0,
       confidence:       'HIGH',
-      reason:           `Hard trust event confirmed: ${incidents[0]}. Engagement not recommended regardless of other signals.`,
+      reason:           `Hard trust event confirmed: ${confirmedHardEvents[0]}. Engagement not recommended regardless of other signals.`,
       reviewPeriod:     'None — do not engage',
       recommendedActions: [
         'Do not transact',
@@ -129,12 +178,12 @@ function runSentinel(input) {
       override: {
         triggered: true,
         type:      'HARD_TRUST_EVENT',
-        reason:    `Confirmed: ${incidents[0]}`,
+        reason:    `Confirmed: ${confirmedHardEvents[0]}`,
         detail:    'Hard trust event detected. Normal scoring bypassed. Automatic AVOID verdict issued.',
       },
       inputSources: {
-        veris: { trustScore: score, incidents },
-        zeru:  { sentiment, riskFactors },
+        veris: { trustScore: score, incidents: confirmedHardEvents },
+        zeru:  { sentiment, riskFactors: normalizedRiskFactors },
       },
       flags: ['HARD_TRUST_EVENT'],
     };
@@ -180,7 +229,7 @@ function runSentinel(input) {
   } else if (score >= 65 && highConf && !isNegative) {
     verdict   = 'PROCEED WITH CAUTION';
     riskClass = 'MEDIUM';
-    reason    = `Adequate trust score (${score}/100, compliance ${complianceScore}/100). ${riskFactors.length > 0 ? `Key risks noted: ${riskFactors.slice(0, 2).join('; ')}.` : 'Some evidence gaps present.'} Independent verification recommended before high-value commitment.`;
+    reason    = `Adequate trust score (${score}/100, compliance ${complianceScore}/100). ${normalizedRiskFactors.length > 0 ? `Key risks noted: ${normalizedRiskFactors.slice(0, 2).join('; ')}.` : 'Some evidence gaps present.'} Independent verification recommended before high-value commitment.`;
     reviewPeriod = '30 days';
     recommendedActions = ['Limit initial exposure', 'Request additional verification documents', 'Schedule 30-day re-audit', 'Do not commit large capital without further diligence'];
     flags.push('EVIDENCE_GAPS');
@@ -196,7 +245,7 @@ function runSentinel(input) {
   } else if (score >= 50) {
     verdict   = 'PROCEED WITH CAUTION';
     riskClass = 'MEDIUM';
-    reason    = `Mixed trust signals (${score}/100, compliance ${complianceScore}/100). ${riskFactors.length > 0 ? `Identified risks: ${riskFactors.slice(0, 3).join('; ')}.` : 'Multiple unverified claims.'} Limit exposure until verification complete.`;
+    reason    = `Mixed trust signals (${score}/100, compliance ${complianceScore}/100). ${normalizedRiskFactors.length > 0 ? `Identified risks: ${normalizedRiskFactors.slice(0, 3).join('; ')}.` : 'Multiple unverified claims.'} Limit exposure until verification complete.`;
     reviewPeriod = '14 days';
     recommendedActions = ['Do not commit significant capital', 'Obtain independent third-party verification', 'Re-audit in 14 days', 'Establish clear exit conditions'];
     flags.push('MIXED_SIGNALS');
@@ -204,7 +253,7 @@ function runSentinel(input) {
   } else if (score >= 30) {
     verdict   = 'HIGH RISK';
     riskClass = 'HIGH';
-    reason    = `Trust score (${score}/100, compliance ${complianceScore}/100) is below acceptable threshold. ${riskFactors.length > 0 ? `Specific risks: ${riskFactors.slice(0, 3).join('; ')}.` : 'Significant evidence gaps.'} Engagement carries substantial risk.`;
+    reason    = `Trust score (${score}/100, compliance ${complianceScore}/100) is below acceptable threshold. ${normalizedRiskFactors.length > 0 ? `Specific risks: ${normalizedRiskFactors.slice(0, 3).join('; ')}.` : 'Significant evidence gaps.'} Engagement carries substantial risk.`;
     reviewPeriod = 'Re-audit required — minimum 7 day hold';
     recommendedActions = ['Do not transact without executive approval', 'Do not invest', 'Obtain legal review before any integration', 'Re-audit after 90 days or material evidence change'];
     flags.push('BELOW_THRESHOLD');
@@ -212,7 +261,7 @@ function runSentinel(input) {
   } else {
     verdict   = 'AVOID';
     riskClass = 'CRITICAL';
-    reason    = `Trust score (${score}/100, compliance ${complianceScore}/100) is critically low. ${riskFactors.length > 0 ? `Risk factors: ${riskFactors.slice(0, 3).join('; ')}.` : 'Insufficient legitimate signals.'} Do not engage.`;
+    reason    = `Trust score (${score}/100, compliance ${complianceScore}/100) is critically low. ${normalizedRiskFactors.length > 0 ? `Risk factors: ${normalizedRiskFactors.slice(0, 3).join('; ')}.` : 'Insufficient legitimate signals.'} Do not engage.`;
     reviewPeriod = 'None — re-audit in 90 days if circumstances change';
     recommendedActions = ['Do not transact', 'Do not invest', 'Do not integrate', 'Re-evaluate only if trust signals materially improve'];
     flags.push('CRITICAL_SCORE');
@@ -274,13 +323,10 @@ OVERRIDE TRIGGERED
   Detail:  ${decision.override.detail}`
     : '';
 
-  const riskList = (input.riskFactors || []).length
-    ? (input.riskFactors || []).slice(0, 5).map(r => `  • ${r}`).join('\n')
-    : '  • None identified';
-
-  const incidentList = (input.incidents || []).length
-    ? (input.incidents || []).map(i => `  ⛔ ${i}`).join('\n')
-    : '  ✓ None';
+  const riskItems    = (input.riskFactors || []).map(normalizeItem).filter(Boolean);
+  const incidentItems = (input.incidents  || []).map(normalizeItem).filter(isHardEvent);
+  const riskList    = riskItems.length    ? riskItems.slice(0, 5).map(r => `  • ${r}`).join('\n') : '  • None identified';
+  const incidentList = incidentItems.length ? incidentItems.map(i => `  ⛔ ${i}`).join('\n') : '  ✓ None';
 
   return `SENTINEL COMPLIANCE DECISION
 ═══════════════════════════════════════════════
@@ -320,7 +366,7 @@ ${actions}
 INPUT SOURCE ATTRIBUTION
   VERIS (Trust Engine):
     • Trust Score:  ${input.trustScore ?? 'N/A'}/100
-    • Incidents:    ${(input.incidents || []).length > 0 ? (input.incidents || []).map(i => `\n      ⛔ ${i}`).join('') : '✓ None'}
+    • Incidents:    ${incidentItems.length > 0 ? incidentItems.map(i => `\n      ⛔ ${i}`).join('') : '✓ None'}
   ZERU (Research Agent):
     • Sentiment:    ${(input.sentiment || 'neutral').toUpperCase()}
     • Risk Factors: ${(input.riskFactors || []).length}
